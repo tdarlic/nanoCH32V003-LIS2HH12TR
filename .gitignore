@@ -1,0 +1,9 @@
+firmware/*.bin
+firmware/*.elf
+firmware/*.hex
+firmware/*.lst
+firmware/*.map
+firmware/ch32v003fun/ch32fun/generated_*.ld
+python/.venv/
+python/__pycache__/
+*.pyc
