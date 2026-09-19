@@ -87,11 +87,25 @@ Send a line (`command\n`) over the UART at 115200 baud:
 | `INT ON <X\|Y\|Z\|ANY> <HIGH\|LOW> [thresh_mg] [dur]` | Arm the interrupt generator on a threshold-crossing event |
 | `INT OFF` | Disarm the interrupt generator |
 | `INT STATUS` | Report the interrupt source register |
+| `FS <2\|4\|8>` | Change the full-scale range (+-2g / +-4g / +-8g) |
+| `PEAK` | Report the highest \|g\| seen since the last reset |
+| `PEAK RESET` | Reset the peak-hold value |
 | `HELP` | List commands |
 
+The LIS2HH12 supports switchable full-scale ranges like most accelerometers
+(2g/4g/8g here - some parts also offer 16g, this one doesn't). Changing `FS`
+updates the sensor's `CTRL4` register and the firmware's mg-per-LSB
+conversion factor together, so `ACC` output stays correctly scaled in mg
+regardless of range.
+
+Peak-hold (`PEAK`) tracks the highest combined magnitude
+(`sqrt(x^2+y^2+z^2)`) seen on every sample, independent of whether
+`STREAM` is on or off - so it keeps capturing shocks/peaks even while the
+live output is paused.
+
 Output lines include `ACC,..`, `SELFTEST,..`, `FIFOSTATUS,..`,
-`FIFOSAMPLE,..`, `INTSTATUS,..`, spontaneous `INTEVENT,..` when an armed
-interrupt fires, plus `OK,..` / `ERR,..` acknowledgements.
+`FIFOSAMPLE,..`, `INTSTATUS,..`, `PEAK,..`, spontaneous `INTEVENT,..` when
+an armed interrupt fires, plus `OK,..` / `ERR,..` acknowledgements.
 
 ## Python test interface
 
@@ -104,12 +118,15 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 `dashboard.py` is a terminal dashboard (curses) covering all of the above:
 
-- Live bar-graph visualization of X/Y/Z plus `|g|` magnitude
+- Live bar-graph visualization of X/Y/Z (scaled to the current full-scale
+  range) plus `|g|` magnitude and the peak-hold value
 - Raw X/Y/Z readout pinned at the bottom of the screen at all times
 - `s` - run self-test
 - `o` - change ODR
+- `g` - change full-scale range (2/4/8g)
 - `f` - FIFO/stream mode submenu (set mode+threshold, check status, read samples)
 - `i` - interrupt submenu (arm/disarm, check status)
+- `p` - reset the peak-hold value
 - `r` - pause/resume the live stream
 - `q` - quit
 

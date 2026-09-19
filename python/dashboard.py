@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Terminal dashboard for testing the LIS2HH12 accelerometer.
 
-Covers: self-test, changing the output data rate, FIFO / stream mode,
-interrupt generation, and a live bar-graph visualization. Raw X/Y/Z stays
-pinned at the bottom of the screen at all times.
+Covers: self-test, changing the output data rate, changing the full-scale
+range (+-2g/4g/8g), FIFO / stream mode, interrupt generation, peak-hold
+(highest |g| since reset), and a live bar-graph visualization. Raw X/Y/Z
+stays pinned at the bottom of the screen at all times.
 
 Usage: python3 dashboard.py [port]   (default /dev/ttyACM0)
 """
@@ -14,18 +15,20 @@ import time
 from lis2hh12_link import Link, parse_acc
 
 BAR_WIDTH = 40
-BAR_RANGE_MG = 2000  # +-2g full scale
 
 MENU = [
     ("s", "Self-test"),
     ("o", "Change ODR"),
+    ("g", "Change scale"),
     ("f", "FIFO / stream mode"),
     ("i", "Interrupt test"),
+    ("p", "Reset peak"),
     ("r", "Resume/pause live stream"),
     ("q", "Quit"),
 ]
 
 ODR_NAMES = ["off", "10Hz", "50Hz", "100Hz", "200Hz", "400Hz", "800Hz"]
+FS_OPTIONS = ["2", "4", "8"]
 
 FIFO_MODES = [
     ("1", "BYPASS"),
@@ -44,6 +47,10 @@ class Dashboard:
         self.x = self.y = self.z = 0
         self.log = []  # newest last
         self.odr_name = "100Hz"
+        self.fs_g = 2
+        self.bar_range_mg = 2000
+        self.peak_mg = 0
+        self._last_peak_poll = 0.0
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.timeout(50)
@@ -62,11 +69,16 @@ class Dashboard:
         self.log = self.log[-200:]
 
     def consume(self, lines):
-        """Route ACC lines into the live readout, log everything else."""
+        """Route ACC/PEAK lines into the live readout, log everything else."""
         for line in lines:
             acc = parse_acc(line)
             if acc:
                 self.x, self.y, self.z = acc
+            elif line.startswith("PEAK,"):
+                try:
+                    self.peak_mg = int(line[len("PEAK,"):])
+                except ValueError:
+                    self.add_log(line)
             else:
                 self.add_log(line)
 
@@ -87,13 +99,13 @@ class Dashboard:
         center = 4 + BAR_WIDTH // 2
         self.safe_addstr(win, row, 0, f"{label}:")
         self.safe_addstr(win, row, 4, "|" + " " * BAR_WIDTH + "|")
-        pos = int(center + (value / BAR_RANGE_MG) * (BAR_WIDTH // 2))
+        pos = int(center + (value / self.bar_range_mg) * (BAR_WIDTH // 2))
         pos = max(5, min(4 + BAR_WIDTH, pos))
         lo, hi = (center, pos) if pos >= center else (pos, center)
         attr = 0
         if self.has_color:
-            mag = abs(value)
-            color = 1 if mag < 1200 else (2 if mag < 1800 else 3)
+            frac = abs(value) / self.bar_range_mg
+            color = 1 if frac < 0.6 else (2 if frac < 0.9 else 3)
             attr = curses.color_pair(color)
         self.safe_addstr(win, row, lo, "#" * max(1, hi - lo), attr)
         self.safe_addstr(win, row, 4 + BAR_WIDTH + 3, f"{value:6d} mg")
@@ -104,20 +116,22 @@ class Dashboard:
         h, w = stdscr.getmaxyx()
 
         self.safe_addstr(stdscr, 0, 0, "LIS2HH12 test dashboard".ljust(w - 1), curses.A_BOLD)
-        menu_line = f"ODR: {self.odr_name}   |   " + "  ".join(f"[{k}]{label}" for k, label in MENU)
-        self.safe_addstr(stdscr, 1, 0, menu_line)
+        status_line = f"ODR: {self.odr_name}   Scale: +-{self.fs_g}g"
+        self.safe_addstr(stdscr, 1, 0, status_line)
+        menu_line = "  ".join(f"[{k}]{label}" for k, label in MENU)
+        self.safe_addstr(stdscr, 2, 0, menu_line)
 
-        self.bar(stdscr, 3, "X", self.x)
-        self.bar(stdscr, 4, "Y", self.y)
-        self.bar(stdscr, 5, "Z", self.z)
+        self.bar(stdscr, 4, "X", self.x)
+        self.bar(stdscr, 5, "Y", self.y)
+        self.bar(stdscr, 6, "Z", self.z)
 
         mag = (self.x ** 2 + self.y ** 2 + self.z ** 2) ** 0.5
-        self.safe_addstr(stdscr, 6, 0, f"|g| = {mag / 1000:.3f} g")
+        self.safe_addstr(stdscr, 7, 0, f"|g| = {mag / 1000:.3f} g   peak = {self.peak_mg / 1000:.3f} g")
 
-        self.safe_addstr(stdscr, 8, 0, "Log:", curses.A_UNDERLINE)
-        log_h = max(1, h - 12)
+        self.safe_addstr(stdscr, 9, 0, "Log:", curses.A_UNDERLINE)
+        log_h = max(1, h - 13)
         for i, line in enumerate(self.log[-log_h:]):
-            self.safe_addstr(stdscr, 9 + i, 0, line)
+            self.safe_addstr(stdscr, 10 + i, 0, line)
 
         # pinned raw readout at the very bottom
         self.safe_addstr(stdscr, h - 2, 0, "-" * (w - 1))
@@ -177,6 +191,24 @@ class Dashboard:
         self.consume(self.link.wait_for(("OK,ODR", "ERR"), timeout=1.0))
         self.odr_name = ODR_NAMES[n]
 
+    def change_scale(self):
+        s = self.prompt(f"Full scale {FS_OPTIONS} g: ")
+        if s not in FS_OPTIONS:
+            self.add_log(f"invalid scale: {s!r} (must be 2, 4 or 8)")
+            return
+        g = int(s)
+        self.link.send(f"FS {g}")
+        lines = self.link.wait_for(("OK,FS", "ERR"), timeout=1.0)
+        self.consume(lines)
+        if any(l.startswith("OK,FS") for l in lines):
+            self.fs_g = g
+            self.bar_range_mg = g * 1000
+
+    def reset_peak(self):
+        self.peak_mg = 0
+        self.link.send("PEAK RESET")
+        self.consume(self.link.wait_for(("OK,PEAK",), timeout=1.0))
+
     def fifo_menu(self):
         opts = "  ".join(f"[{k}]{name}" for k, name in FIFO_MODES)
         c = self.wait_key(f"FIFO mode: {opts}  [r]ead  [t]status  or Esc: ")
@@ -218,6 +250,10 @@ class Dashboard:
     def run(self):
         while True:
             self.drain()
+            now = time.time()
+            if now - self._last_peak_poll > 1.0:
+                self._last_peak_poll = now
+                self.link.send("PEAK")
             self.draw()
             c = self.stdscr.getch()
             if c == -1:
@@ -229,10 +265,14 @@ class Dashboard:
                 self.run_selftest()
             elif ch == "o":
                 self.change_odr()
+            elif ch == "g":
+                self.change_scale()
             elif ch == "f":
                 self.fifo_menu()
             elif ch == "i":
                 self.int_menu()
+            elif ch == "p":
+                self.reset_peak()
             elif ch == "r":
                 self.toggle_stream()
 

@@ -13,11 +13,14 @@
  *   INT ON <X|Y|Z|ANY> <HIGH|LOW> [thresh_mg] [dur]
  *   INT OFF
  *   INT STATUS
+ *   FS <2|4|8>                             full-scale range in g
+ *   PEAK                                   report the highest |g| seen since the last reset
+ *   PEAK RESET
  *   HELP
  *
  * Output lines: ACC,x,y,z | SELFTEST,axis,normal,st,diff,PASS|FAIL | SELFTEST,DONE |
  *   FIFOSTATUS,fss=..,empty=..,ovr=..,fth=.. | FIFOSAMPLE,x,y,z | FIFOREAD,DONE |
- *   INTSTATUS,ia=..,xh=..,xl=..,yh=..,yl=..,zh=..,zl=.. | INTEVENT,0xNN | OK[,..] | ERR,..
+ *   INTSTATUS,ia=..,xh=..,xl=..,yh=..,yl=..,zh=..,zl=.. | INTEVENT,0xNN | PEAK,mg | OK[,..] | ERR,..
  */
 #include "ch32fun.h"
 #include <stdio.h>
@@ -30,6 +33,30 @@ uint8_t accel_addr;
 volatile uint8_t streaming = 1;
 volatile uint32_t systick_millis;
 uint8_t int_armed = 0;
+int32_t mg_per_lsb = LIS2HH12_MG_PER_LSB_2G;
+uint32_t peak_mg = 0;
+
+// Integer sqrt (binary digit-by-digit method) - no libm with -nostdlib.
+static uint32_t isqrt32(uint32_t n)
+{
+	uint32_t res = 0;
+	uint32_t bit = 1UL << 30;
+	while (bit > n) bit >>= 2;
+	while (bit != 0)
+	{
+		if (n >= res + bit)
+		{
+			n -= res + bit;
+			res = (res >> 1) + bit;
+		}
+		else
+		{
+			res >>= 1;
+		}
+		bit >>= 2;
+	}
+	return res;
+}
 
 static void systick_init(void)
 {
@@ -123,9 +150,9 @@ static void run_selftest(uint8_t addr)
 		lis2hh12_read_xyz(addr, &x, &y, &z);
 		sx += x; sy += y; sz += z;
 	}
-	normal_mg[0] = lis2hh12_to_mg((int16_t)(sx / N));
-	normal_mg[1] = lis2hh12_to_mg((int16_t)(sy / N));
-	normal_mg[2] = lis2hh12_to_mg((int16_t)(sz / N));
+	normal_mg[0] = lis2hh12_to_mg((int16_t)(sx / N), mg_per_lsb);
+	normal_mg[1] = lis2hh12_to_mg((int16_t)(sy / N), mg_per_lsb);
+	normal_mg[2] = lis2hh12_to_mg((int16_t)(sz / N), mg_per_lsb);
 
 	lis2hh12_write_reg(addr, LIS2HH12_CTRL5, LIS2HH12_ST_POSITIVE);
 	Delay_Ms(100);
@@ -137,9 +164,9 @@ static void run_selftest(uint8_t addr)
 		lis2hh12_read_xyz(addr, &x, &y, &z);
 		sx += x; sy += y; sz += z;
 	}
-	st_mg[0] = lis2hh12_to_mg((int16_t)(sx / N));
-	st_mg[1] = lis2hh12_to_mg((int16_t)(sy / N));
-	st_mg[2] = lis2hh12_to_mg((int16_t)(sz / N));
+	st_mg[0] = lis2hh12_to_mg((int16_t)(sx / N), mg_per_lsb);
+	st_mg[1] = lis2hh12_to_mg((int16_t)(sy / N), mg_per_lsb);
+	st_mg[2] = lis2hh12_to_mg((int16_t)(sz / N), mg_per_lsb);
 
 	lis2hh12_write_reg(addr, LIS2HH12_CTRL5, LIS2HH12_ST_NORMAL);
 
@@ -178,7 +205,7 @@ static void fifo_read_all(uint8_t addr)
 		if (!lis2hh12_read_xyz(addr, &x, &y, &z))
 			break;
 		printf("FIFOSAMPLE,%ld,%ld,%ld\n",
-			(long)lis2hh12_to_mg(x), (long)lis2hh12_to_mg(y), (long)lis2hh12_to_mg(z));
+			(long)lis2hh12_to_mg(x, mg_per_lsb), (long)lis2hh12_to_mg(y, mg_per_lsb), (long)lis2hh12_to_mg(z, mg_per_lsb));
 	}
 	printf("FIFOREAD,DONE\n");
 }
@@ -279,11 +306,33 @@ static void handle_line(char *line)
 		}
 		else printf("ERR,usage: INT ON|OFF|STATUS\n");
 	}
+	else if (!strcmp(cmd, "FS"))
+	{
+		int g = parse_int(next_token(&rest));
+		int32_t new_scale = lis2hh12_set_scale(accel_addr, g);
+		if (!new_scale) { printf("ERR,usage: FS 2|4|8\n"); return; }
+		mg_per_lsb = new_scale;
+		printf("OK,FS,%d\n", g);
+	}
+	else if (!strcmp(cmd, "PEAK"))
+	{
+		char *sub = next_token(&rest);
+		if (sub && !strcmp(sub, "RESET"))
+		{
+			peak_mg = 0;
+			printf("OK,PEAK,RESET\n");
+		}
+		else
+		{
+			printf("PEAK,%lu\n", (unsigned long)peak_mg);
+		}
+	}
 	else if (!strcmp(cmd, "HELP"))
 	{
 		printf("Commands: STREAM ON|OFF | ODR 0-6 | SELFTEST | "
 			"FIFO MODE <m> [th] | FIFO STATUS | FIFO READ | "
-			"INT ON <axis> <dir> [mg] [dur] | INT OFF | INT STATUS\n");
+			"INT ON <axis> <dir> [mg] [dur] | INT OFF | INT STATUS | "
+			"FS 2|4|8 | PEAK | PEAK RESET\n");
 	}
 	else
 	{
@@ -369,14 +418,24 @@ int main()
 		}
 
 		uint32_t now = systick_millis;
-		if (streaming && TimeElapsed32u(now, last_stream_ms) >= stream_period_ms)
+		if (TimeElapsed32u(now, last_stream_ms) >= stream_period_ms)
 		{
 			last_stream_ms = now;
 			int16_t x, y, z;
 			if (lis2hh12_read_xyz(accel_addr, &x, &y, &z))
 			{
-				printf("ACC,%ld,%ld,%ld\n",
-					(long)lis2hh12_to_mg(x), (long)lis2hh12_to_mg(y), (long)lis2hh12_to_mg(z));
+				int32_t mgx = lis2hh12_to_mg(x, mg_per_lsb);
+				int32_t mgy = lis2hh12_to_mg(y, mg_per_lsb);
+				int32_t mgz = lis2hh12_to_mg(z, mg_per_lsb);
+
+				// Peak-hold tracks every sample, independent of STREAM ON/OFF.
+				uint32_t mag_sq = (uint32_t)(mgx * mgx) + (uint32_t)(mgy * mgy) + (uint32_t)(mgz * mgz);
+				uint32_t mag = isqrt32(mag_sq);
+				if (mag > peak_mg)
+					peak_mg = mag;
+
+				if (streaming)
+					printf("ACC,%ld,%ld,%ld\n", (long)mgx, (long)mgy, (long)mgz);
 			}
 		}
 	}

@@ -32,8 +32,8 @@
 
 // CTRL1: HR=1, ODR=100Hz(011), BDU=1, Zen=Yen=Xen=1
 #define LIS2HH12_CTRL1_VAL    0xBF
-// CTRL4: FS=+-2g(00), IF_ADD_INC=1 (required for burst reads)
-#define LIS2HH12_CTRL4_VAL    0x04
+// CTRL4: FS=+-2g, IF_ADD_INC=1 (required for burst reads)
+#define LIS2HH12_CTRL4_VAL    (LIS2HH12_FS_2G | 0x04)
 
 // CTRL3 bits
 #define LIS2HH12_CTRL3_FIFO_EN   0x80
@@ -79,8 +79,17 @@
 #define LIS2HH12_IG_SRC_ZH 0x20
 #define LIS2HH12_IG_SRC_IA 0x40
 
-// mg per LSB, +-2g full scale, high-resolution (16-bit) mode
-#define LIS2HH12_MG_PER_LSB   61
+// mg per LSB, high-resolution (16-bit) mode, per full-scale range
+// (datasheet Table 3: 0.061 / 0.122 / 0.244 mg/digit @ +-2g / +-4g / +-8g)
+#define LIS2HH12_MG_PER_LSB_2G   61
+#define LIS2HH12_MG_PER_LSB_4G  122
+#define LIS2HH12_MG_PER_LSB_8G  244
+
+// CTRL4 FS[1:0] is at bits 5:4. 01 (0x1) is not a valid setting.
+#define LIS2HH12_FS_2G (0x0 << 4)
+#define LIS2HH12_FS_4G (0x2 << 4)
+#define LIS2HH12_FS_8G (0x3 << 4)
+
 // IG_THS1 1 LSB ~= FS/128 (established ST convention for this generator)
 #define LIS2HH12_IG_THS_MG_PER_LSB 16
 
@@ -138,9 +147,24 @@ static inline int lis2hh12_read_xyz(uint8_t addr, int16_t *x, int16_t *y, int16_
 	return 1;
 }
 
-static inline int32_t lis2hh12_to_mg(int16_t raw)
+static inline int32_t lis2hh12_to_mg(int16_t raw, int32_t mg_per_lsb)
 {
-	return ((int32_t)raw * LIS2HH12_MG_PER_LSB) / 1000;
+	return ((int32_t)raw * mg_per_lsb) / 1000;
+}
+
+// g: 2, 4 or 8. Returns the new mg_per_lsb scale factor, or 0 if invalid.
+static inline int32_t lis2hh12_set_scale(uint8_t addr, int g)
+{
+	uint8_t fs;
+	int32_t mg_per_lsb;
+
+	if (g == 2) { fs = LIS2HH12_FS_2G; mg_per_lsb = LIS2HH12_MG_PER_LSB_2G; }
+	else if (g == 4) { fs = LIS2HH12_FS_4G; mg_per_lsb = LIS2HH12_MG_PER_LSB_4G; }
+	else if (g == 8) { fs = LIS2HH12_FS_8G; mg_per_lsb = LIS2HH12_MG_PER_LSB_8G; }
+	else return 0;
+
+	lis2hh12_write_reg(addr, LIS2HH12_CTRL4, fs | 0x04); // keep IF_ADD_INC
+	return mg_per_lsb;
 }
 
 #endif
