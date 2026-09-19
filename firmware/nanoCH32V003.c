@@ -2,6 +2,9 @@
  * (TX=PD5, RX=PD6), read via the WCH-LinkE's RXD/TXD pins at 115200 baud.
  *
  * I2C wiring: SDA -> PC1, SCL -> PC2 (CH32V003 I2C1 default pins, no remap).
+ * INT1 wiring: sensor INT1 (breakout J2 pin 2) -> PD4. The sensor drives
+ * INT1 push-pull, active-high by default, so PD4 is a real electrical
+ * edge-triggered interrupt (EXTI4), not just I2C status polling.
  *
  * Line-based command protocol (send a command + '\n'):
  *   STREAM ON|OFF
@@ -13,14 +16,20 @@
  *   INT ON <X|Y|Z|ANY> <HIGH|LOW> [thresh_mg] [dur]
  *   INT OFF
  *   INT STATUS
+ *   INT PINSTATUS                          real INT1 pin (EXTI4) level + edge count
  *   FS <2|4|8>                             full-scale range in g
  *   PEAK                                   report the highest |g| seen since the last reset
  *   PEAK RESET
  *   HELP
  *
- * Output lines: ACC,x,y,z | SELFTEST,axis,normal,st,diff,PASS|FAIL | SELFTEST,DONE |
+ * Output lines: ACC,x,y,z,temp_mC | SELFTEST,axis,normal,st,diff,PASS|FAIL | SELFTEST,DONE |
  *   FIFOSTATUS,fss=..,empty=..,ovr=..,fth=.. | FIFOSAMPLE,x,y,z | FIFOREAD,DONE |
- *   INTSTATUS,ia=..,xh=..,xl=..,yh=..,yl=..,zh=..,zl=.. | INTEVENT,0xNN | PEAK,mg | OK[,..] | ERR,..
+ *   INTSTATUS,ia=..,xh=..,xl=..,yh=..,yl=..,zh=..,zl=.. | INTEVENT,0xNN | PEAK,mg |
+ *   INTPINSTATUS,level=..,edges=.. | INTPIN,level=..,edges=.. (spontaneous, on change) |
+ *   OK[,..] | ERR,..
+ *
+ * temp_mC is the embedded temperature sensor in milli-degC (relative
+ * sensor for thermal-drift compensation, not a calibrated absolute reading).
  */
 #include "ch32fun.h"
 #include <stdio.h>
@@ -34,7 +43,36 @@ volatile uint8_t streaming = 1;
 volatile uint32_t systick_millis;
 uint8_t int_armed = 0;
 int32_t mg_per_lsb = LIS2HH12_MG_PER_LSB_2G;
+int32_t fs_mg = 2000; // current full-scale range in mg (2000/4000/8000)
 uint32_t peak_mg = 0;
+
+// Real electrical INT1 pin (PD4, EXTI4). Updated from the ISR on every
+// edge; the main loop just reads these, no I2C access from the ISR.
+volatile uint8_t int_pin_level = 0;
+volatile uint32_t int_pin_edges = 0;
+
+static void exti4_init(void)
+{
+	// PD4 floating input; the sensor drives INT1 push-pull (default).
+	funPinMode(PD4, GPIO_CFGLR_IN_FLOAT);
+
+	AFIO->EXTICR = (AFIO->EXTICR & ~AFIO_EXTICR_EXTI4) | AFIO_EXTICR_EXTI4_PD;
+	EXTI->INTENR |= EXTI_INTENR_MR4;
+	EXTI->RTENR |= EXTI_RTENR_TR4; // rising edge
+	EXTI->FTENR |= EXTI_FTENR_TR4; // falling edge
+	NVIC_EnableIRQ(EXTI7_0_IRQn);
+}
+
+void EXTI7_0_IRQHandler(void) __attribute__((interrupt));
+void EXTI7_0_IRQHandler(void)
+{
+	if (EXTI->INTFR & EXTI_INTF_INTF4)
+	{
+		EXTI->INTFR = EXTI_INTF_INTF4; // write 1 to clear
+		int_pin_level = (uint8_t)funDigitalRead(PD4);
+		int_pin_edges++;
+	}
+}
 
 // Integer sqrt (binary digit-by-digit method) - no libm with -nostdlib.
 static uint32_t isqrt32(uint32_t n)
@@ -277,7 +315,7 @@ static void handle_line(char *line)
 			if (!strcmp(axis, "X") || !strcmp(axis, "ANY")) cfg |= high ? LIS2HH12_IG_XHIE : LIS2HH12_IG_XLIE;
 			if (!strcmp(axis, "Y") || !strcmp(axis, "ANY")) cfg |= high ? LIS2HH12_IG_YHIE : LIS2HH12_IG_YLIE;
 			if (!strcmp(axis, "Z") || !strcmp(axis, "ANY")) cfg |= high ? LIS2HH12_IG_ZHIE : LIS2HH12_IG_ZLIE;
-			uint8_t ths = (uint8_t)(thresh_mg / LIS2HH12_IG_THS_MG_PER_LSB);
+			uint8_t ths = lis2hh12_ig_ths_from_mg(thresh_mg, fs_mg);
 			lis2hh12_write_reg(accel_addr, LIS2HH12_IG_THS_X1, ths);
 			lis2hh12_write_reg(accel_addr, LIS2HH12_IG_THS_Y1, ths);
 			lis2hh12_write_reg(accel_addr, LIS2HH12_IG_THS_Z1, ths);
@@ -304,7 +342,11 @@ static void handle_line(char *line)
 				(src & LIS2HH12_IG_SRC_YL) ? 1 : 0, (src & LIS2HH12_IG_SRC_ZH) ? 1 : 0,
 				(src & LIS2HH12_IG_SRC_ZL) ? 1 : 0);
 		}
-		else printf("ERR,usage: INT ON|OFF|STATUS\n");
+		else if (sub && !strcmp(sub, "PINSTATUS"))
+		{
+			printf("INTPINSTATUS,level=%d,edges=%lu\n", int_pin_level, (unsigned long)int_pin_edges);
+		}
+		else printf("ERR,usage: INT ON|OFF|STATUS|PINSTATUS\n");
 	}
 	else if (!strcmp(cmd, "FS"))
 	{
@@ -312,6 +354,7 @@ static void handle_line(char *line)
 		int32_t new_scale = lis2hh12_set_scale(accel_addr, g);
 		if (!new_scale) { printf("ERR,usage: FS 2|4|8\n"); return; }
 		mg_per_lsb = new_scale;
+		fs_mg = g * 1000;
 		printf("OK,FS,%d\n", g);
 	}
 	else if (!strcmp(cmd, "PEAK"))
@@ -331,7 +374,7 @@ static void handle_line(char *line)
 	{
 		printf("Commands: STREAM ON|OFF | ODR 0-6 | SELFTEST | "
 			"FIFO MODE <m> [th] | FIFO STATUS | FIFO READ | "
-			"INT ON <axis> <dir> [mg] [dur] | INT OFF | INT STATUS | "
+			"INT ON <axis> <dir> [mg] [dur] | INT OFF | INT STATUS | INT PINSTATUS | "
 			"FS 2|4|8 | PEAK | PEAK RESET\n");
 	}
 	else
@@ -358,6 +401,8 @@ int main()
 	funPinMode(PC1, GPIO_CFGLR_OUT_10Mhz_AF_OD); // SDA
 	funPinMode(PC2, GPIO_CFGLR_OUT_10Mhz_AF_OD); // SCL
 
+	exti4_init(); // PD4 <- sensor INT1
+
 	i2c_init(I2C1, FUNCONF_SYSTEM_CORE_CLOCK, 100000);
 	Delay_Ms(100);
 
@@ -375,6 +420,7 @@ int main()
 	uint8_t cmdlen = 0;
 	uint32_t last_cmd_byte_ms = 0;
 	uint32_t last_stream_ms = 0;
+	uint32_t last_reported_pin_edges = 0;
 	const uint32_t stream_period_ms = 50;
 	const uint32_t cmd_idle_timeout_ms = 500;
 
@@ -417,6 +463,15 @@ int main()
 				printf("INTEVENT,0x%02X\n", src);
 		}
 
+		// Real electrical INT1 pin: report spontaneously whenever the ISR
+		// has seen a new edge, independent of int_armed/I2C polling above.
+		uint32_t edges_now = int_pin_edges;
+		if (edges_now != last_reported_pin_edges)
+		{
+			last_reported_pin_edges = edges_now;
+			printf("INTPIN,level=%d,edges=%lu\n", int_pin_level, (unsigned long)edges_now);
+		}
+
 		uint32_t now = systick_millis;
 		if (TimeElapsed32u(now, last_stream_ms) >= stream_period_ms)
 		{
@@ -435,7 +490,13 @@ int main()
 					peak_mg = mag;
 
 				if (streaming)
-					printf("ACC,%ld,%ld,%ld\n", (long)mgx, (long)mgy, (long)mgz);
+				{
+					int16_t traw = 0;
+					int32_t temp_mc = 0;
+					if (lis2hh12_read_temp_raw(accel_addr, &traw))
+						temp_mc = lis2hh12_temp_to_mc(traw);
+					printf("ACC,%ld,%ld,%ld,%ld\n", (long)mgx, (long)mgy, (long)mgz, (long)temp_mc);
+				}
 			}
 		}
 	}

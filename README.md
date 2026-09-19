@@ -43,6 +43,17 @@ No separate USB-serial adapter needed - the LinkE's RXD/TXD pins bridge to
 a USB virtual COM port (`/dev/ttyACM0` on Linux) over the same USB cable
 used for programming.
 
+**INT1 (real electrical interrupt, optional):**
+
+| LIS2HH12TR breakout (J2 header) | nanoCH32V003 |
+|---|---|
+| Pin 2 (INT1) | PD4 |
+
+The sensor drives INT1 push-pull, active-high by default, so this is a
+genuine edge-triggered hardware interrupt (`EXTI4`), not just I2C status
+polling - see `INT PINSTATUS` below. GND is already shared via the I2C
+wiring above.
+
 ### A note on dupont wires
 
 Loose/marginal dupont wire connections were the cause of nearly every
@@ -63,9 +74,11 @@ make flash      # build and flash
 ```
 
 `nanoCH32V003.c` brings up I2C1, finds the LIS2HH12 (WHO_AM_I check,
-tries both possible I2C addresses), and streams `ACC,x,y,z` (in mg) over
-UART1 at 115200 baud, 20 times/second. It also accepts commands over the
-same UART link (see below).
+tries both possible I2C addresses), and streams `ACC,x,y,z,temp_mc` (x/y/z
+in mg, temp_mc in milli-degC from the sensor's embedded temperature
+sensor - relative/drift-compensation only, not a calibrated absolute
+reading) over UART1 at 115200 baud, 20 times/second. It also accepts
+commands over the same UART link (see below).
 
 All firmware I/O goes over the real UART (PD5/PD6), not the WCH-LinkE's
 debug channel - so `make monitor`/`minichlink -T` won't show anything
@@ -78,7 +91,7 @@ Send a line (`command\n`) over the UART at 115200 baud:
 
 | Command | Effect |
 |---|---|
-| `STREAM ON` / `STREAM OFF` | Enable/disable the periodic `ACC,x,y,z` output |
+| `STREAM ON` / `STREAM OFF` | Enable/disable the periodic `ACC,x,y,z,temp_mc` output |
 | `ODR <0-6>` | Change the sensor's output data rate: 0=power-down, 1=10Hz, 2=50Hz, 3=100Hz, 4=200Hz, 5=400Hz, 6=800Hz |
 | `SELFTEST` | Run the ST-spec self-test (electrostatic force actuation) and report PASS/FAIL per axis |
 | `FIFO MODE <mode> [thresh]` | Set FIFO mode: `BYPASS`, `FIFO`, `STREAM`, `STREAM2FIFO`, `BYPASS2STREAM`, `BYPASS2FIFO`; threshold 0-31 |
@@ -86,7 +99,8 @@ Send a line (`command\n`) over the UART at 115200 baud:
 | `FIFO READ` | Drain and print all samples currently buffered in the FIFO |
 | `INT ON <X\|Y\|Z\|ANY> <HIGH\|LOW> [thresh_mg] [dur]` | Arm the interrupt generator on a threshold-crossing event |
 | `INT OFF` | Disarm the interrupt generator |
-| `INT STATUS` | Report the interrupt source register |
+| `INT STATUS` | Report the interrupt source register (I2C-polled `IG_SRC1`) |
+| `INT PINSTATUS` | Report the real INT1 pin's current level and edge count (PD4/`EXTI4`) |
 | `FS <2\|4\|8>` | Change the full-scale range (+-2g / +-4g / +-8g) |
 | `PEAK` | Report the highest \|g\| seen since the last reset |
 | `PEAK RESET` | Reset the peak-hold value |
@@ -103,9 +117,17 @@ Peak-hold (`PEAK`) tracks the highest combined magnitude
 `STREAM` is on or off - so it keeps capturing shocks/peaks even while the
 live output is paused.
 
+`INT ON` arms the interrupt generator two ways at once: `INT STATUS` polls
+the sensor's `IG_SRC1` register over I2C (works with no extra wiring, but
+only reflects whatever was true the last time it was polled), while
+`INT PINSTATUS`/the spontaneous `INTPIN` line reflect the real INT1 pin on
+PD4, updated instantly from an `EXTI4` interrupt the moment the electrical
+signal changes - a genuine hardware interrupt, not polling.
+
 Output lines include `ACC,..`, `SELFTEST,..`, `FIFOSTATUS,..`,
-`FIFOSAMPLE,..`, `INTSTATUS,..`, `PEAK,..`, spontaneous `INTEVENT,..` when
-an armed interrupt fires, plus `OK,..` / `ERR,..` acknowledgements.
+`FIFOSAMPLE,..`, `INTSTATUS,..`, `INTPINSTATUS,..`, `PEAK,..`, spontaneous
+`INTEVENT,..` (I2C-polled) and `INTPIN,..` (real pin, on every edge), plus
+`OK,..` / `ERR,..` acknowledgements.
 
 ## Python test interface
 
@@ -119,13 +141,16 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 `dashboard.py` is a terminal dashboard (curses) covering all of the above:
 
 - Live bar-graph visualization of X/Y/Z (scaled to the current full-scale
-  range) plus `|g|` magnitude and the peak-hold value
+  range) plus `|g|` magnitude, the peak-hold value, and temperature
+- Live INT1 pin readout (real electrical level + edge count, PD4/`EXTI4`),
+  updated the instant the physical interrupt fires
 - Raw X/Y/Z readout pinned at the bottom of the screen at all times
 - `s` - run self-test
 - `o` - change ODR
 - `g` - change full-scale range (2/4/8g)
 - `f` - FIFO/stream mode submenu (set mode+threshold, check status, read samples)
-- `i` - interrupt submenu (arm/disarm, check status)
+- `i` - interrupt submenu (arm/disarm, check status - shows both the
+  I2C-polled status and the real INT1 pin side by side)
 - `p` - reset the peak-hold value
 - `r` - pause/resume the live stream
 - `q` - quit

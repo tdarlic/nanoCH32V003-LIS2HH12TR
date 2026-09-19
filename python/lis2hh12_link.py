@@ -72,11 +72,14 @@ class Link:
 
 
 def parse_acc(line):
-    """Return (x, y, z) mg ints if `line` is an ACC line, else None."""
+    """Return (x, y, z, temp_mc) ints if `line` is an ACC line, else None.
+
+    x/y/z are mg, temp_mc is milli-degC.
+    """
     if not line.startswith("ACC,"):
         return None
     try:
-        x, y, z = (int(v) for v in line[4:].split(","))
+        x, y, z, temp_mc = (int(v) for v in line[4:].split(","))
     except ValueError:
         return None
-    return x, y, z
+    return x, y, z, temp_mc

@@ -11,6 +11,8 @@
 #define LIS2HH12_ADDR_SA0_LOW  0x19
 #define LIS2HH12_ADDR_SA0_HIGH 0x1D
 
+#define LIS2HH12_TEMP_L       0x0B
+#define LIS2HH12_TEMP_H       0x0C
 #define LIS2HH12_WHO_AM_I     0x0F
 #define LIS2HH12_WHO_AM_I_VAL 0x41
 
@@ -90,8 +92,18 @@
 #define LIS2HH12_FS_4G (0x2 << 4)
 #define LIS2HH12_FS_8G (0x3 << 4)
 
-// IG_THS1 1 LSB ~= FS/128 (established ST convention for this generator)
-#define LIS2HH12_IG_THS_MG_PER_LSB 16
+// IG_THS1 (8-bit) scales with the current full-scale range: 1 LSB = FS/256.
+// Empirically measured on real hardware (not documented in the datasheet):
+// swept the raw threshold register against a steady ~1008 mg reading at
+// +-2g and found the trigger boundary between raw 128 (fires) and 129
+// (doesn't) - i.e. ~7.8 mg/LSB, matching FS_mg/256 = 2000/256 = 7.8125.
+static inline uint8_t lis2hh12_ig_ths_from_mg(int32_t thresh_mg, int32_t fs_mg)
+{
+	int32_t ths = (thresh_mg * 256) / fs_mg;
+	if (ths < 0) ths = 0;
+	if (ths > 255) ths = 255;
+	return (uint8_t)ths;
+}
 
 static inline int lis2hh12_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
 {
@@ -150,6 +162,28 @@ static inline int lis2hh12_read_xyz(uint8_t addr, int16_t *x, int16_t *y, int16_
 static inline int32_t lis2hh12_to_mg(int16_t raw, int32_t mg_per_lsb)
 {
 	return ((int32_t)raw * mg_per_lsb) / 1000;
+}
+
+// Embedded temperature sensor: 16-bit two's complement, 11-bit resolution
+// (bottom 5 bits don't-care), 8 LSB/degC at that resolution, offset so
+// that a raw value of 0 reads as 25 degC (ST driver's
+// lis2hh12_from_lsb_to_celsius: (raw/32)/8 + 25). This sensor is relative
+// / for thermal-drift compensation, not a calibrated absolute reading.
+static inline int lis2hh12_read_temp_raw(uint8_t addr, int16_t *temp)
+{
+	uint8_t raw[2];
+
+	if (i2c_readReg_buffer(I2C1, addr, LIS2HH12_TEMP_L, raw, 2))
+		return 0;
+
+	*temp = (int16_t)((raw[1] << 8) | raw[0]);
+	return 1;
+}
+
+// Returns temperature in milli-degC.
+static inline int32_t lis2hh12_temp_to_mc(int16_t raw)
+{
+	return ((int32_t)raw * 1000) / 256 + 25000;
 }
 
 // g: 2, 4 or 8. Returns the new mg_per_lsb scale factor, or 0 if invalid.

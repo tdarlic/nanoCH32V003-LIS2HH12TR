@@ -2,9 +2,10 @@
 """Terminal dashboard for testing the LIS2HH12 accelerometer.
 
 Covers: self-test, changing the output data rate, changing the full-scale
-range (+-2g/4g/8g), FIFO / stream mode, interrupt generation, peak-hold
-(highest |g| since reset), and a live bar-graph visualization. Raw X/Y/Z
-stays pinned at the bottom of the screen at all times.
+range (+-2g/4g/8g), FIFO / stream mode, interrupt generation (both the
+I2C-polled status and the real electrical INT1 pin on PD4/EXTI4),
+peak-hold (highest |g| since reset), and a live bar-graph visualization.
+Raw X/Y/Z stays pinned at the bottom of the screen at all times.
 
 Usage: python3 dashboard.py [port]   (default /dev/ttyACM0)
 """
@@ -15,6 +16,7 @@ import time
 from lis2hh12_link import Link, parse_acc
 
 BAR_WIDTH = 40
+PROMPT_ROW = 3  # fixed row, directly under the menu - always the same place
 
 MENU = [
     ("s", "Self-test"),
@@ -44,13 +46,15 @@ class Dashboard:
     def __init__(self, stdscr, link):
         self.stdscr = stdscr
         self.link = link
-        self.x = self.y = self.z = 0
+        self.x = self.y = self.z = self.temp_mc = 0
         self.log = []  # newest last
         self.odr_name = "100Hz"
         self.fs_g = 2
         self.bar_range_mg = 2000
         self.peak_mg = 0
         self._last_peak_poll = 0.0
+        self.int_pin_level = 0
+        self.int_pin_edges = 0
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.timeout(50)
@@ -73,11 +77,21 @@ class Dashboard:
         for line in lines:
             acc = parse_acc(line)
             if acc:
-                self.x, self.y, self.z = acc
+                self.x, self.y, self.z, self.temp_mc = acc
             elif line.startswith("PEAK,"):
                 try:
                     self.peak_mg = int(line[len("PEAK,"):])
                 except ValueError:
+                    self.add_log(line)
+            elif line.startswith("INTPIN"):
+                # covers both the spontaneous "INTPIN,level=..,edges=.."
+                # and the on-demand "INTPINSTATUS,level=..,edges=.." reply -
+                # both share the same "level=..,edges=.." payload.
+                try:
+                    kv = dict(p.split("=") for p in line.split(",", 1)[1].split(","))
+                    self.int_pin_level = int(kv["level"])
+                    self.int_pin_edges = int(kv["edges"])
+                except (IndexError, ValueError, KeyError):
                     self.add_log(line)
             else:
                 self.add_log(line)
@@ -126,49 +140,80 @@ class Dashboard:
         self.bar(stdscr, 6, "Z", self.z)
 
         mag = (self.x ** 2 + self.y ** 2 + self.z ** 2) ** 0.5
-        self.safe_addstr(stdscr, 7, 0, f"|g| = {mag / 1000:.3f} g   peak = {self.peak_mg / 1000:.3f} g")
+        self.safe_addstr(stdscr, 7, 0,
+            f"|g| = {mag / 1000:.3f} g   peak = {self.peak_mg / 1000:.3f} g   "
+            f"temp = {self.temp_mc / 1000:.1f} C")
 
-        self.safe_addstr(stdscr, 9, 0, "Log:", curses.A_UNDERLINE)
-        log_h = max(1, h - 13)
+        pin_attr = curses.color_pair(1) if (self.has_color and self.int_pin_level) else 0
+        self.safe_addstr(stdscr, 8, 0,
+            f"INT1 pin (PD4, real electrical, EXTI4): level={self.int_pin_level}  "
+            f"edges={self.int_pin_edges}", pin_attr)
+
+        self.safe_addstr(stdscr, 10, 0, "Log:", curses.A_UNDERLINE)
+        log_h = max(1, h - 14)
         for i, line in enumerate(self.log[-log_h:]):
-            self.safe_addstr(stdscr, 10 + i, 0, line)
+            self.safe_addstr(stdscr, 11 + i, 0, line)
 
         # pinned raw readout at the very bottom
         self.safe_addstr(stdscr, h - 2, 0, "-" * (w - 1))
         self.safe_addstr(stdscr, h - 1, 0,
-            f"RAW  x={self.x:6d} mg  y={self.y:6d} mg  z={self.z:6d} mg",
+            f"RAW  x={self.x:6d} mg  y={self.y:6d} mg  z={self.z:6d} mg  "
+            f"temp={self.temp_mc / 1000:5.1f} C",
             curses.A_BOLD)
 
         stdscr.refresh()
 
     # ---- blocking helpers for menu prompts -----------------------------
+    # Both always draw on the same fixed row, right under the menu, with a
+    # reverse-video bar so it's unmistakable that input is expected and
+    # exactly where to look - rather than a bare cursor floating somewhere
+    # near the bottom of the screen with no visible label.
+    def clear_prompt_row(self):
+        h, w = self.stdscr.getmaxyx()
+        self.stdscr.addstr(PROMPT_ROW, 0, " " * (w - 1))
+
     def prompt(self, label, default=""):
         h, w = self.stdscr.getmaxyx()
-        self.stdscr.addstr(h - 4, 0, " " * (w - 1))
-        self.stdscr.addstr(h - 4, 0, label)
+        self.clear_prompt_row()
+        header = f"> {label}"[: w - 1]
+        self.stdscr.addstr(PROMPT_ROW, 0, header.ljust(w - 1), curses.A_REVERSE)
+        self.stdscr.refresh()
+
         curses.curs_set(1)
         curses.echo()
         self.stdscr.nodelay(False)
         self.stdscr.timeout(-1)
-        win = curses.newwin(1, 30, h - 4, len(label) + 1)
+
+        input_col = min(len(header) + 1, max(0, w - 22))
+        win = curses.newwin(1, 20, PROMPT_ROW, input_col)
         win.addstr(0, 0, default)
-        curses.curs_set(1)
-        s = win.getstr(0, 0, 20).decode(errors="replace") or default
+        win.refresh()
+        try:
+            s = win.getstr(0, 0, 19).decode(errors="replace") or default
+        except curses.error:
+            s = default
+
         curses.noecho()
         curses.curs_set(0)
         self.stdscr.nodelay(True)
         self.stdscr.timeout(50)
+        self.clear_prompt_row()
+        self.stdscr.refresh()
         return s.strip()
 
     def wait_key(self, prompt_text):
         h, w = self.stdscr.getmaxyx()
-        self.stdscr.addstr(h - 4, 0, prompt_text[: w - 1])
+        self.clear_prompt_row()
+        header = f"> {prompt_text}"[: w - 1]
+        self.stdscr.addstr(PROMPT_ROW, 0, header.ljust(w - 1), curses.A_REVERSE)
         self.stdscr.refresh()
         self.stdscr.nodelay(False)
         self.stdscr.timeout(-1)
         c = self.stdscr.getch()
         self.stdscr.nodelay(True)
         self.stdscr.timeout(50)
+        self.clear_prompt_row()
+        self.stdscr.refresh()
         return chr(c) if 0 < c < 256 else ""
 
     # ---- actions --------------------------------------------------------
@@ -178,7 +223,8 @@ class Dashboard:
         self.consume(self.link.wait_for(("SELFTEST,DONE",), timeout=3.0))
 
     def change_odr(self):
-        s = self.prompt(f"ODR index 0-6 {ODR_NAMES}: ")
+        odr_hint = " ".join(f"{i}={name}" for i, name in enumerate(ODR_NAMES))
+        s = self.prompt(f"ODR ({odr_hint}): ")
         try:
             n = int(s)
         except ValueError:
@@ -226,7 +272,7 @@ class Dashboard:
             self.consume(self.link.wait_for(("FIFOSTATUS",), timeout=1.0))
 
     def int_menu(self):
-        c = self.wait_key("Interrupt: [o]n  [f]off  [t]status  or Esc: ")
+        c = self.wait_key("Interrupt: [o]n  [f]off  [t]status (I2C-polled + real pin)  or Esc: ")
         if c == "o":
             axis = self.prompt("Axis (X/Y/Z/ANY): ", "ANY").upper() or "ANY"
             direction = self.prompt("Direction (HIGH/LOW): ", "HIGH").upper() or "HIGH"
@@ -234,13 +280,16 @@ class Dashboard:
             dur = self.prompt("Duration (ODR cycles, default 0): ", "0") or "0"
             self.link.send(f"INT ON {axis} {direction} {thresh} {dur}")
             self.consume(self.link.wait_for(("OK,INT", "ERR"), timeout=1.0))
-            self.add_log("armed - move/shake the board to trigger it")
+            self.add_log("armed - move/shake the board to trigger it "
+                          "(watch the INT1 pin line above for the real edge)")
         elif c == "f":
             self.link.send("INT OFF")
             self.consume(self.link.wait_for(("OK,INT",), timeout=1.0))
         elif c == "t":
             self.link.send("INT STATUS")
             self.consume(self.link.wait_for(("INTSTATUS",), timeout=1.0))
+            self.link.send("INT PINSTATUS")
+            self.consume(self.link.wait_for(("INTPINSTATUS",), timeout=1.0))
 
     def toggle_stream(self):
         self._streaming = not getattr(self, "_streaming", True)
@@ -248,6 +297,11 @@ class Dashboard:
         self.consume(self.link.wait_for(("OK",), timeout=1.0))
 
     def run(self):
+        # Sync the real INT1 pin's current level/edge count before the
+        # first draw - after this, spontaneous INTPIN lines keep it live.
+        self.link.send("INT PINSTATUS")
+        self.consume(self.link.wait_for(("INTPINSTATUS",), timeout=1.0))
+
         while True:
             self.drain()
             now = time.time()
