@@ -2,10 +2,13 @@
 """Terminal dashboard for testing the LIS2HH12 accelerometer.
 
 Covers: self-test, changing the output data rate, changing the full-scale
-range (+-2g/4g/8g), FIFO / stream mode, interrupt generation (both the
-I2C-polled status and the real electrical INT1 pin on PD4/EXTI4),
-peak-hold (highest |g| since reset), and a live bar-graph visualization.
-Raw X/Y/Z stays pinned at the bottom of the screen at all times.
+range (+-2g/4g/8g), FIFO / stream mode, generic interrupt generator
+testing (IG1/INT1), wake-on-movement (Activity/Inactivity/INT1), impact/
+collision detection (IG2/INT2), peak-hold (highest |g| since reset), and
+a live bar-graph visualization. Both real electrical interrupt pins
+(INT1 on PD4/EXTI4, INT2 on PD3/EXTI3) are always shown with their
+level, edge count, and whether/how they're currently armed. Raw X/Y/Z
+stays pinned at the bottom of the screen at all times.
 
 Usage: python3 dashboard.py [port]   (default /dev/ttyACM0)
 """
@@ -23,7 +26,9 @@ MENU = [
     ("o", "Change ODR"),
     ("g", "Change scale"),
     ("f", "FIFO / stream mode"),
-    ("i", "Interrupt test"),
+    ("i", "Interrupt test (IG1/INT1)"),
+    ("w", "Wake on movement (INT1)"),
+    ("c", "Impact/collision (INT2)"),
     ("p", "Reset peak"),
     ("r", "Resume/pause live stream"),
     ("q", "Quit"),
@@ -49,12 +54,16 @@ class Dashboard:
         self.x = self.y = self.z = self.temp_mc = 0
         self.log = []  # newest last
         self.odr_name = "100Hz"
-        self.fs_g = 2
-        self.bar_range_mg = 2000
+        self.fs_g = 8  # firmware default; the startup sync in run() confirms it
+        self.bar_range_mg = 8000
         self.peak_mg = 0
         self._last_peak_poll = 0.0
         self.int_pin_level = 0
         self.int_pin_edges = 0
+        self.int2_pin_level = 0
+        self.int2_pin_edges = 0
+        self.int1_armed = None  # None | "IG1" | "WAKE"
+        self.int2_armed = False
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.timeout(50)
@@ -83,6 +92,14 @@ class Dashboard:
                     self.peak_mg = int(line[len("PEAK,"):])
                 except ValueError:
                     self.add_log(line)
+            elif line.startswith("FS,"):
+                # bare query reply, e.g. from the startup sync below - the
+                # "OK,FS,n" ack from change_scale() is handled separately.
+                try:
+                    self.fs_g = int(line[len("FS,"):])
+                    self.bar_range_mg = self.fs_g * 1000
+                except ValueError:
+                    self.add_log(line)
             elif line.startswith("INTPIN"):
                 # covers both the spontaneous "INTPIN,level=..,edges=.."
                 # and the on-demand "INTPINSTATUS,level=..,edges=.." reply -
@@ -91,6 +108,15 @@ class Dashboard:
                     kv = dict(p.split("=") for p in line.split(",", 1)[1].split(","))
                     self.int_pin_level = int(kv["level"])
                     self.int_pin_edges = int(kv["edges"])
+                except (IndexError, ValueError, KeyError):
+                    self.add_log(line)
+            elif line.startswith("IMPACTPIN"):
+                # same deal for INT2: "IMPACTPIN,.." (spontaneous) and
+                # "IMPACTPINSTATUS,.." (on-demand) share the same payload.
+                try:
+                    kv = dict(p.split("=") for p in line.split(",", 1)[1].split(","))
+                    self.int2_pin_level = int(kv["level"])
+                    self.int2_pin_edges = int(kv["edges"])
                 except (IndexError, ValueError, KeyError):
                     self.add_log(line)
             else:
@@ -144,15 +170,35 @@ class Dashboard:
             f"|g| = {mag / 1000:.3f} g   peak = {self.peak_mg / 1000:.3f} g   "
             f"temp = {self.temp_mc / 1000:.1f} C")
 
-        pin_attr = curses.color_pair(1) if (self.has_color and self.int_pin_level) else 0
+        armed1 = self.int1_armed or "not armed"
+        if self.int1_armed == "WAKE":
+            # PD4 polarity is inverted from the intuitive reading in this
+            # mode (verified with a real physical test, not documented
+            # anywhere): HIGH means STILL/inactive, LOW means MOVING/
+            # active - the INT1_INACT bit reports inactivity, not
+            # activity. Show the actually-useful interpretation instead
+            # of a raw level that reads backwards from what you'd guess.
+            note = "MOVING" if self.int_pin_level == 0 else "STILL"
+            highlight = self.int_pin_level == 0
+        else:
+            note = "TRIGGERED" if self.int_pin_level else "idle"
+            highlight = bool(self.int_pin_level)
+        pin1_attr = curses.color_pair(1) if (self.has_color and highlight) else 0
         self.safe_addstr(stdscr, 8, 0,
-            f"INT1 pin (PD4, real electrical, EXTI4): level={self.int_pin_level}  "
-            f"edges={self.int_pin_edges}", pin_attr)
+            f"INT1 pin (PD4, EXTI4): level={self.int_pin_level}  edges={self.int_pin_edges}  "
+            f"[{armed1}: {note}]", pin1_attr)
 
-        self.safe_addstr(stdscr, 10, 0, "Log:", curses.A_UNDERLINE)
-        log_h = max(1, h - 14)
+        armed2 = "IMPACT" if self.int2_armed else "not armed"
+        note2 = "TRIGGERED" if self.int2_pin_level else "idle"
+        pin2_attr = curses.color_pair(3) if (self.has_color and self.int2_pin_level) else 0
+        self.safe_addstr(stdscr, 9, 0,
+            f"INT2 pin (PD3, EXTI3): level={self.int2_pin_level}  edges={self.int2_pin_edges}  "
+            f"[{armed2}: {note2}]", pin2_attr)
+
+        self.safe_addstr(stdscr, 11, 0, "Log:", curses.A_UNDERLINE)
+        log_h = max(1, h - 15)
         for i, line in enumerate(self.log[-log_h:]):
-            self.safe_addstr(stdscr, 11 + i, 0, line)
+            self.safe_addstr(stdscr, 12 + i, 0, line)
 
         # pinned raw readout at the very bottom
         self.safe_addstr(stdscr, h - 2, 0, "-" * (w - 1))
@@ -275,21 +321,59 @@ class Dashboard:
         c = self.wait_key("Interrupt: [o]n  [f]off  [t]status (I2C-polled + real pin)  or Esc: ")
         if c == "o":
             axis = self.prompt("Axis (X/Y/Z/ANY): ", "ANY").upper() or "ANY"
-            direction = self.prompt("Direction (HIGH/LOW): ", "HIGH").upper() or "HIGH"
+            direction = self.prompt(
+                "Direction HIGH(>+thresh)/LOW(|val|<thresh, near-zero, NOT neg-excursion): ",
+                "HIGH").upper() or "HIGH"
             thresh = self.prompt("Threshold mg (default 500): ", "500") or "500"
             dur = self.prompt("Duration (ODR cycles, default 0): ", "0") or "0"
             self.link.send(f"INT ON {axis} {direction} {thresh} {dur}")
             self.consume(self.link.wait_for(("OK,INT", "ERR"), timeout=1.0))
+            self.int1_armed = "IG1"
             self.add_log("armed - move/shake the board to trigger it "
                           "(watch the INT1 pin line above for the real edge)")
         elif c == "f":
             self.link.send("INT OFF")
             self.consume(self.link.wait_for(("OK,INT",), timeout=1.0))
+            self.int1_armed = None
         elif c == "t":
             self.link.send("INT STATUS")
             self.consume(self.link.wait_for(("INTSTATUS",), timeout=1.0))
             self.link.send("INT PINSTATUS")
             self.consume(self.link.wait_for(("INTPINSTATUS",), timeout=1.0))
+
+    def wake_menu(self):
+        c = self.wait_key("Wake (Activity/Inactivity, INT1): [o]n  [f]off  or Esc: ")
+        if c == "o":
+            thresh = self.prompt("Movement threshold mg (default 100): ", "100") or "100"
+            dur = self.prompt("Inactivity debounce, ACT_DUR (default 0): ", "0") or "0"
+            self.link.send(f"WAKE ON {thresh} {dur}")
+            self.consume(self.link.wait_for(("OK,WAKE", "ERR"), timeout=1.0))
+            self.int1_armed = "WAKE"
+            self.add_log("wake armed - watch the INT1 line above (shows STILL/MOVING, "
+                          "not raw level - see note below the pin lines)")
+        elif c == "f":
+            self.link.send("WAKE OFF")
+            self.consume(self.link.wait_for(("OK,WAKE",), timeout=1.0))
+            self.int1_armed = None
+
+    def impact_menu(self):
+        c = self.wait_key("Impact/collision (IG2, INT2): [o]n  [f]off  [t]status  or Esc: ")
+        if c == "o":
+            thresh = self.prompt("Impact threshold mg (default 2000): ", "2000") or "2000"
+            dur = self.prompt("Duration (ODR cycles, default 0): ", "0") or "0"
+            self.link.send(f"IMPACT ON {thresh} {dur}")
+            self.consume(self.link.wait_for(("OK,IMPACT", "ERR"), timeout=1.0))
+            self.int2_armed = True
+            self.add_log("armed - watch the INT2 pin line above for a real hit")
+        elif c == "f":
+            self.link.send("IMPACT OFF")
+            self.consume(self.link.wait_for(("OK,IMPACT",), timeout=1.0))
+            self.int2_armed = False
+        elif c == "t":
+            self.link.send("IMPACT STATUS")
+            self.consume(self.link.wait_for(("IMPACTSTATUS",), timeout=1.0))
+            self.link.send("IMPACT PINSTATUS")
+            self.consume(self.link.wait_for(("IMPACTPINSTATUS",), timeout=1.0))
 
     def toggle_stream(self):
         self._streaming = not getattr(self, "_streaming", True)
@@ -297,10 +381,23 @@ class Dashboard:
         self.consume(self.link.wait_for(("OK",), timeout=1.0))
 
     def run(self):
-        # Sync the real INT1 pin's current level/edge count before the
-        # first draw - after this, spontaneous INTPIN lines keep it live.
+        # Sync display state that the firmware owns before the first draw,
+        # so we show what's actually configured rather than a guessed
+        # default. After this, spontaneous lines (INTPIN, ACC, ...) keep
+        # everything live.
         self.link.send("INT PINSTATUS")
         self.consume(self.link.wait_for(("INTPINSTATUS",), timeout=1.0))
+        self.link.send("IMPACT PINSTATUS")
+        self.consume(self.link.wait_for(("IMPACTPINSTATUS",), timeout=1.0))
+        self.link.send("FS")
+        self.consume(self.link.wait_for(("FS,",), timeout=1.0))
+        # Note: pin level/edges above sync from real hardware, but the
+        # "[armed by ...]" label is tracked client-side from this
+        # session's own actions only - there's no single query that
+        # reports which mechanism (if any) is currently routed to a
+        # pin, so a restart can't recover a "still armed from before"
+        # state. The pin's real level/edges are always ground truth
+        # regardless.
 
         while True:
             self.drain()
@@ -325,6 +422,10 @@ class Dashboard:
                 self.fifo_menu()
             elif ch == "i":
                 self.int_menu()
+            elif ch == "w":
+                self.wake_menu()
+            elif ch == "c":
+                self.impact_menu()
             elif ch == "p":
                 self.reset_peak()
             elif ch == "r":

@@ -13,6 +13,8 @@
 
 #define LIS2HH12_TEMP_L       0x0B
 #define LIS2HH12_TEMP_H       0x0C
+#define LIS2HH12_ACT_THS      0x1E
+#define LIS2HH12_ACT_DUR      0x1F
 #define LIS2HH12_WHO_AM_I     0x0F
 #define LIS2HH12_WHO_AM_I_VAL 0x41
 
@@ -21,6 +23,7 @@
 #define LIS2HH12_CTRL3        0x22
 #define LIS2HH12_CTRL4        0x23
 #define LIS2HH12_CTRL5        0x24
+#define LIS2HH12_CTRL6        0x25
 #define LIS2HH12_STATUS       0x27
 #define LIS2HH12_OUT_X_L      0x28
 #define LIS2HH12_FIFO_CTRL    0x2E
@@ -31,17 +34,28 @@
 #define LIS2HH12_IG_THS_Y1    0x33
 #define LIS2HH12_IG_THS_Z1    0x34
 #define LIS2HH12_IG_DUR1      0x35
+#define LIS2HH12_IG_CFG2      0x36
+#define LIS2HH12_IG_SRC2      0x37
+#define LIS2HH12_IG_THS2      0x38
+#define LIS2HH12_IG_DUR2      0x39
 
 // CTRL1: HR=1, ODR=100Hz(011), BDU=1, Zen=Yen=Xen=1
 #define LIS2HH12_CTRL1_VAL    0xBF
 // CTRL4: FS=+-2g, IF_ADD_INC=1 (required for burst reads)
 #define LIS2HH12_CTRL4_VAL    (LIS2HH12_FS_2G | 0x04)
 
-// CTRL3 bits
-#define LIS2HH12_CTRL3_FIFO_EN   0x80
-#define LIS2HH12_CTRL3_STOP_FTH  0x40
-#define LIS2HH12_CTRL3_INT1_IG1  0x08
-#define LIS2HH12_CTRL3_INT1_DRDY 0x01
+// CTRL3 bits (INT1 routing)
+#define LIS2HH12_CTRL3_FIFO_EN    0x80
+#define LIS2HH12_CTRL3_STOP_FTH   0x40
+#define LIS2HH12_CTRL3_INT1_INACT 0x20
+#define LIS2HH12_CTRL3_INT1_IG2   0x10
+#define LIS2HH12_CTRL3_INT1_IG1   0x08
+#define LIS2HH12_CTRL3_INT1_DRDY  0x01
+
+// CTRL6 bits (INT2 routing) - no INACT option here; Activity/Inactivity
+// can only be brought out on INT1.
+#define LIS2HH12_CTRL6_INT2_IG2   0x10
+#define LIS2HH12_CTRL6_INT2_IG1   0x08
 
 // CTRL5 self-test bits (ST2,ST1 at bits 3,2)
 #define LIS2HH12_ST_NORMAL    0x00
@@ -100,6 +114,16 @@
 static inline uint8_t lis2hh12_ig_ths_from_mg(int32_t thresh_mg, int32_t fs_mg)
 {
 	int32_t ths = (thresh_mg * 256) / fs_mg;
+	if (ths < 0) ths = 0;
+	if (ths > 255) ths = 255;
+	return (uint8_t)ths;
+}
+
+// ACT_THS (8-bit) scales as FS/128 per the datasheet (Table 9) - this one
+// IS documented, unlike IG_THS1/IG_THS2 above.
+static inline uint8_t lis2hh12_act_ths_from_mg(int32_t thresh_mg, int32_t fs_mg)
+{
+	int32_t ths = (thresh_mg * 128) / fs_mg;
 	if (ths < 0) ths = 0;
 	if (ths > 255) ths = 255;
 	return (uint8_t)ths;

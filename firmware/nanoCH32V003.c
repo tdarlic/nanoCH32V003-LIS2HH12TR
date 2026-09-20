@@ -2,9 +2,40 @@
  * (TX=PD5, RX=PD6), read via the WCH-LinkE's RXD/TXD pins at 115200 baud.
  *
  * I2C wiring: SDA -> PC1, SCL -> PC2 (CH32V003 I2C1 default pins, no remap).
- * INT1 wiring: sensor INT1 (breakout J2 pin 2) -> PD4. The sensor drives
- * INT1 push-pull, active-high by default, so PD4 is a real electrical
- * edge-triggered interrupt (EXTI4), not just I2C status polling.
+ *
+ * INT1 wiring: sensor INT1 (breakout J2 pin 2) -> PD4 (EXTI4).
+ * INT2 wiring: sensor INT2 (breakout J2 pin 3) -> PD3 (EXTI3).
+ * Both driven push-pull, active-high by default, so these are real
+ * electrical edge-triggered interrupts, not just I2C status polling.
+ * Both pins have a storm circuit breaker: a floating/marginal
+ * connection with both edges armed can oscillate fast enough to
+ * re-enter the ISR forever and hang the whole board (observed in
+ * practice). Past STORM_THRESHOLD edges without the main loop getting
+ * a chance to run, the ISR self-disables that one line and reports
+ * "tripped=1" in its PINSTATUS output plus a one-shot ERR line.
+ * Re-arming (INT ON / WAKE ON / IMPACT ON) clears the trip and
+ * re-enables the line, so fixing the wiring and retrying just works.
+ *
+ * Two product-shaped features sit on top of the generic IG1/IG2 test
+ * commands, each intentionally exclusive to one physical pin:
+ *   WAKE   - Activity/Inactivity function (a dedicated low-power hardware
+ *            block, distinct from IG1/IG2) -> INT1 only. The chip also
+ *            auto-drops to 10Hz sampling while still. No I2C status
+ *            register exists for this - INT PINSTATUS (the real pin) is
+ *            the only way to observe it, which is also how a real
+ *            low-power product would use it (MCU asleep, wakes on the
+ *            GPIO edge). PIN POLARITY IS INVERTED FROM THE INTUITIVE
+ *            READING (verified with a real physical still-then-shake
+ *            test, not documented anywhere): PD4 HIGH means INACTIVE/
+ *            STILL, LOW means ACTIVE/MOVING. The bit is literally named
+ *            INT1_INACT - it reports inactivity, not activity. A boat
+ *            sitting still at the dock will correctly show this pin
+ *            HIGH almost all the time; that's not a bug.
+ *   IMPACT - Interrupt generator 2, all axes, HIGH direction (an impact
+ *            can come from any direction) -> INT2 only.
+ * WAKE and the generic "INT ON" (IG1) command both target INT1 and will
+ * fight over the same pin if both armed - arming one clears the other's
+ * routing.
  *
  * Line-based command protocol (send a command + '\n'):
  *   STREAM ON|OFF
@@ -13,19 +44,32 @@
  *   FIFO MODE <mode> [thresh 0-31]         mode: BYPASS FIFO STREAM STREAM2FIFO BYPASS2STREAM BYPASS2FIFO
  *   FIFO STATUS
  *   FIFO READ
- *   INT ON <X|Y|Z|ANY> <HIGH|LOW> [thresh_mg] [dur]
+ *   INT ON <X|Y|Z|ANY> <HIGH|LOW> [thresh_mg] [dur]   (IG1 -> INT1, exploratory)
+ *     HIGH: signed axis value exceeds +thresh_mg (positive-direction excursion).
+ *     LOW:  |axis value| drops BELOW thresh_mg, regardless of sign - this is
+ *           NOT a "large negative excursion" detector (empirically verified;
+ *           not documented in the datasheet). This chip's interrupt generator
+ *           is designed for 6D/4D orientation recognition, where LOW means
+ *           "this axis is near zero", not "swung strongly negative".
  *   INT OFF
  *   INT STATUS
  *   INT PINSTATUS                          real INT1 pin (EXTI4) level + edge count
- *   FS <2|4|8>                             full-scale range in g
+ *   WAKE ON [thresh_mg] [dur]              Activity/Inactivity -> INT1 (see above)
+ *   WAKE OFF
+ *   IMPACT ON [thresh_mg] [dur]            IG2, any axis, HIGH -> INT2 (collision)
+ *   IMPACT OFF
+ *   IMPACT STATUS
+ *   IMPACT PINSTATUS                       real INT2 pin (EXTI3) level + edge count
+ *   FS [2|4|8]                             set, or with no arg report, the full-scale range in g (default 8)
  *   PEAK                                   report the highest |g| seen since the last reset
  *   PEAK RESET
  *   HELP
  *
  * Output lines: ACC,x,y,z,temp_mC | SELFTEST,axis,normal,st,diff,PASS|FAIL | SELFTEST,DONE |
  *   FIFOSTATUS,fss=..,empty=..,ovr=..,fth=.. | FIFOSAMPLE,x,y,z | FIFOREAD,DONE |
- *   INTSTATUS,ia=..,xh=..,xl=..,yh=..,yl=..,zh=..,zl=.. | INTEVENT,0xNN | PEAK,mg |
- *   INTPINSTATUS,level=..,edges=.. | INTPIN,level=..,edges=.. (spontaneous, on change) |
+ *   INTSTATUS,ia=..,.. | IMPACTSTATUS,ia=..,.. | INTEVENT,0xNN | IMPACTEVENT,0xNN | PEAK,mg |
+ *   INTPINSTATUS,level=..,edges=..,tripped=.. | INTPIN,level=..,edges=..,tripped=.. (spontaneous) |
+ *   IMPACTPINSTATUS,level=..,edges=..,tripped=.. | IMPACTPIN,level=..,edges=..,tripped=.. (spontaneous) |
  *   OK[,..] | ERR,..
  *
  * temp_mC is the embedded temperature sensor in milli-degC (relative
@@ -42,24 +86,55 @@ uint8_t accel_addr;
 volatile uint8_t streaming = 1;
 volatile uint32_t systick_millis;
 uint8_t int_armed = 0;
-int32_t mg_per_lsb = LIS2HH12_MG_PER_LSB_2G;
-int32_t fs_mg = 2000; // current full-scale range in mg (2000/4000/8000)
+uint8_t impact_armed = 0;
+// Default to +-8g: a boat tracker needs headroom to catch real collisions
+// without the sensor clipping (at +-2g anything over 2g would just
+// saturate and never register as a bigger hit).
+int32_t mg_per_lsb = LIS2HH12_MG_PER_LSB_8G;
+int32_t fs_mg = 8000; // current full-scale range in mg (2000/4000/8000)
 uint32_t peak_mg = 0;
 
-// Real electrical INT1 pin (PD4, EXTI4). Updated from the ISR on every
-// edge; the main loop just reads these, no I2C access from the ISR.
+// Real electrical INT1 pin (PD4, EXTI4) and INT2 pin (PD3, EXTI3).
+// Updated from the ISR on every edge; the main loop just reads these,
+// no I2C access from the ISR. Both lines share one NVIC vector on this
+// MCU (EXTI7_0_IRQn covers lines 0-7).
 volatile uint8_t int_pin_level = 0;
 volatile uint32_t int_pin_edges = 0;
+volatile uint8_t int2_pin_level = 0;
+volatile uint32_t int2_pin_edges = 0;
 
-static void exti4_init(void)
+// Storm circuit breaker: a floating/marginal connection with both edges
+// armed can oscillate fast enough to re-enter the ISR on every return,
+// starving the main loop forever (observed in practice - looks exactly
+// like a dead board, no serial output at all). Each EXTI line has a
+// burst counter that the ISR increments and the main loop resets every
+// pass; if the main loop never gets to run between edges, the counter
+// keeps climbing and the ISR self-disables that one line once it crosses
+// the threshold, instead of hanging the whole board.
+#define STORM_THRESHOLD 200
+volatile uint32_t int_storm_count = 0;
+volatile uint32_t int2_storm_count = 0;
+volatile uint8_t int_storm_tripped = 0;
+volatile uint8_t int2_storm_tripped = 0;
+
+static void exti_init(void)
 {
-	// PD4 floating input; the sensor drives INT1 push-pull (default).
-	funPinMode(PD4, GPIO_CFGLR_IN_FLOAT);
+	// PD4 (INT1), PD3 (INT2): pull-down inputs. The sensor drives both
+	// push-pull when actually connected and configured (easily overrides
+	// a weak pull), but a bare floating input left both edges armed with
+	// nothing to hold the line while disconnected/undriven - any noise
+	// pickup free-runs the ISR and starves the main loop. The pull-down
+	// is a safety net against exactly that, whatever the root cause.
+	funPinMode(PD4, GPIO_CFGLR_IN_PUPD);
+	funDigitalWrite(PD4, FUN_LOW);
+	funPinMode(PD3, GPIO_CFGLR_IN_PUPD);
+	funDigitalWrite(PD3, FUN_LOW);
 
 	AFIO->EXTICR = (AFIO->EXTICR & ~AFIO_EXTICR_EXTI4) | AFIO_EXTICR_EXTI4_PD;
-	EXTI->INTENR |= EXTI_INTENR_MR4;
-	EXTI->RTENR |= EXTI_RTENR_TR4; // rising edge
-	EXTI->FTENR |= EXTI_FTENR_TR4; // falling edge
+	AFIO->EXTICR = (AFIO->EXTICR & ~AFIO_EXTICR_EXTI3) | AFIO_EXTICR_EXTI3_PD;
+	EXTI->INTENR |= EXTI_INTENR_MR4 | EXTI_INTENR_MR3;
+	EXTI->RTENR |= EXTI_RTENR_TR4 | EXTI_RTENR_TR3; // rising edge
+	EXTI->FTENR |= EXTI_FTENR_TR4 | EXTI_FTENR_TR3; // falling edge
 	NVIC_EnableIRQ(EXTI7_0_IRQn);
 }
 
@@ -71,7 +146,41 @@ void EXTI7_0_IRQHandler(void)
 		EXTI->INTFR = EXTI_INTF_INTF4; // write 1 to clear
 		int_pin_level = (uint8_t)funDigitalRead(PD4);
 		int_pin_edges++;
+		if (++int_storm_count > STORM_THRESHOLD)
+		{
+			EXTI->INTENR &= ~EXTI_INTENR_MR4; // self-disable this line only
+			int_storm_tripped = 1;
+		}
 	}
+	if (EXTI->INTFR & EXTI_INTF_INTF3)
+	{
+		EXTI->INTFR = EXTI_INTF_INTF3;
+		int2_pin_level = (uint8_t)funDigitalRead(PD3);
+		int2_pin_edges++;
+		if (++int2_storm_count > STORM_THRESHOLD)
+		{
+			EXTI->INTENR &= ~EXTI_INTENR_MR3;
+			int2_storm_tripped = 1;
+		}
+	}
+}
+
+// Called from the "ON" commands below: clears a tripped breaker and
+// re-enables the line, so fixing the wiring and re-arming just works.
+static void exti_rearm1(void)
+{
+	int_storm_tripped = 0;
+	int_storm_count = 0;
+	EXTI->INTFR = EXTI_INTF_INTF4; // clear any stale pending flag first
+	EXTI->INTENR |= EXTI_INTENR_MR4;
+}
+
+static void exti_rearm2(void)
+{
+	int2_storm_tripped = 0;
+	int2_storm_count = 0;
+	EXTI->INTFR = EXTI_INTF_INTF3;
+	EXTI->INTENR |= EXTI_INTENR_MR3;
 }
 
 // Integer sqrt (binary digit-by-digit method) - no libm with -nostdlib.
@@ -323,6 +432,7 @@ static void handle_line(char *line)
 			lis2hh12_write_reg(accel_addr, LIS2HH12_IG_CFG1, cfg);
 			lis2hh12_write_reg(accel_addr, LIS2HH12_CTRL3, LIS2HH12_CTRL3_INT1_IG1);
 			int_armed = 1;
+			exti_rearm1();
 			printf("OK,INT,ON,%s,%s,%d,%d\n", axis, dir, thresh_mg, dur);
 		}
 		else if (sub && !strcmp(sub, "OFF"))
@@ -344,15 +454,96 @@ static void handle_line(char *line)
 		}
 		else if (sub && !strcmp(sub, "PINSTATUS"))
 		{
-			printf("INTPINSTATUS,level=%d,edges=%lu\n", int_pin_level, (unsigned long)int_pin_edges);
+			printf("INTPINSTATUS,level=%d,edges=%lu,tripped=%d\n",
+				int_pin_level, (unsigned long)int_pin_edges, int_storm_tripped);
 		}
 		else printf("ERR,usage: INT ON|OFF|STATUS|PINSTATUS\n");
 	}
+	else if (!strcmp(cmd, "WAKE"))
+	{
+		char *sub = next_token(&rest);
+		if (sub && !strcmp(sub, "ON"))
+		{
+			char *thstr = next_token(&rest);
+			char *durstr = next_token(&rest);
+			int thresh_mg = thstr ? parse_int(thstr) : 100;
+			int dur = durstr ? parse_int(durstr) : 0;
+			uint8_t ths = lis2hh12_act_ths_from_mg(thresh_mg, fs_mg);
+			lis2hh12_write_reg(accel_addr, LIS2HH12_ACT_THS, ths);
+			lis2hh12_write_reg(accel_addr, LIS2HH12_ACT_DUR, (uint8_t)(dur & 0x7F));
+			// Route only Activity/Inactivity to INT1 - clears any generic
+			// IG1 routing a prior "INT ON" left there, since they'd
+			// otherwise share (and contend for) the same physical pin.
+			lis2hh12_write_reg(accel_addr, LIS2HH12_CTRL3, LIS2HH12_CTRL3_INT1_INACT);
+			int_armed = 0;
+			exti_rearm1();
+			printf("OK,WAKE,ON,%d,%d\n", thresh_mg, dur);
+		}
+		else if (sub && !strcmp(sub, "OFF"))
+		{
+			lis2hh12_write_reg(accel_addr, LIS2HH12_ACT_THS, 0); // 0 disables the feature (datasheet)
+			lis2hh12_write_reg(accel_addr, LIS2HH12_CTRL3, 0);
+			printf("OK,WAKE,OFF\n");
+		}
+		else printf("ERR,usage: WAKE ON [mg] [dur] | WAKE OFF "
+			"(no I2C status register for this - use INT PINSTATUS, the real INT1 pin)\n");
+	}
+	else if (!strcmp(cmd, "IMPACT"))
+	{
+		char *sub = next_token(&rest);
+		if (sub && !strcmp(sub, "ON"))
+		{
+			char *thstr = next_token(&rest);
+			char *durstr = next_token(&rest);
+			int thresh_mg = thstr ? parse_int(thstr) : 2000;
+			int dur = durstr ? parse_int(durstr) : 0;
+			uint8_t ths = lis2hh12_ig_ths_from_mg(thresh_mg, fs_mg);
+			lis2hh12_write_reg(accel_addr, LIS2HH12_IG_THS2, ths);
+			lis2hh12_write_reg(accel_addr, LIS2HH12_IG_DUR2, (uint8_t)(dur & 0x7F));
+			// Any axis, any strong positive-direction hit - a collision
+			// can come from any direction.
+			lis2hh12_write_reg(accel_addr, LIS2HH12_IG_CFG2,
+				LIS2HH12_IG_XHIE | LIS2HH12_IG_YHIE | LIS2HH12_IG_ZHIE);
+			lis2hh12_write_reg(accel_addr, LIS2HH12_CTRL6, LIS2HH12_CTRL6_INT2_IG2);
+			impact_armed = 1;
+			exti_rearm2();
+			printf("OK,IMPACT,ON,%d,%d\n", thresh_mg, dur);
+		}
+		else if (sub && !strcmp(sub, "OFF"))
+		{
+			lis2hh12_write_reg(accel_addr, LIS2HH12_IG_CFG2, 0);
+			lis2hh12_write_reg(accel_addr, LIS2HH12_CTRL6, 0);
+			impact_armed = 0;
+			printf("OK,IMPACT,OFF\n");
+		}
+		else if (sub && !strcmp(sub, "STATUS"))
+		{
+			uint8_t src = 0;
+			lis2hh12_read_reg(accel_addr, LIS2HH12_IG_SRC2, &src);
+			printf("IMPACTSTATUS,ia=%d,xh=%d,xl=%d,yh=%d,yl=%d,zh=%d,zl=%d\n",
+				(src & LIS2HH12_IG_SRC_IA) ? 1 : 0, (src & LIS2HH12_IG_SRC_XH) ? 1 : 0,
+				(src & LIS2HH12_IG_SRC_XL) ? 1 : 0, (src & LIS2HH12_IG_SRC_YH) ? 1 : 0,
+				(src & LIS2HH12_IG_SRC_YL) ? 1 : 0, (src & LIS2HH12_IG_SRC_ZH) ? 1 : 0,
+				(src & LIS2HH12_IG_SRC_ZL) ? 1 : 0);
+		}
+		else if (sub && !strcmp(sub, "PINSTATUS"))
+		{
+			printf("IMPACTPINSTATUS,level=%d,edges=%lu,tripped=%d\n",
+				int2_pin_level, (unsigned long)int2_pin_edges, int2_storm_tripped);
+		}
+		else printf("ERR,usage: IMPACT ON|OFF|STATUS|PINSTATUS\n");
+	}
 	else if (!strcmp(cmd, "FS"))
 	{
-		int g = parse_int(next_token(&rest));
+		char *arg = next_token(&rest);
+		if (!arg)
+		{
+			printf("FS,%ld\n", (long)(fs_mg / 1000));
+			return;
+		}
+		int g = parse_int(arg);
 		int32_t new_scale = lis2hh12_set_scale(accel_addr, g);
-		if (!new_scale) { printf("ERR,usage: FS 2|4|8\n"); return; }
+		if (!new_scale) { printf("ERR,usage: FS [2|4|8]\n"); return; }
 		mg_per_lsb = new_scale;
 		fs_mg = g * 1000;
 		printf("OK,FS,%d\n", g);
@@ -375,7 +566,9 @@ static void handle_line(char *line)
 		printf("Commands: STREAM ON|OFF | ODR 0-6 | SELFTEST | "
 			"FIFO MODE <m> [th] | FIFO STATUS | FIFO READ | "
 			"INT ON <axis> <dir> [mg] [dur] | INT OFF | INT STATUS | INT PINSTATUS | "
-			"FS 2|4|8 | PEAK | PEAK RESET\n");
+			"WAKE ON [mg] [dur] | WAKE OFF | "
+			"IMPACT ON [mg] [dur] | IMPACT OFF | IMPACT STATUS | IMPACT PINSTATUS | "
+			"FS [2|4|8] | PEAK | PEAK RESET\n");
 	}
 	else
 	{
@@ -401,7 +594,7 @@ int main()
 	funPinMode(PC1, GPIO_CFGLR_OUT_10Mhz_AF_OD); // SDA
 	funPinMode(PC2, GPIO_CFGLR_OUT_10Mhz_AF_OD); // SCL
 
-	exti4_init(); // PD4 <- sensor INT1
+	exti_init(); // PD4 <- sensor INT1, PD3 <- sensor INT2
 
 	i2c_init(I2C1, FUNCONF_SYSTEM_CORE_CLOCK, 100000);
 	Delay_Ms(100);
@@ -414,18 +607,27 @@ int main()
 	}
 	printf("LIS2HH12 found at 0x%02X\n", accel_addr);
 	lis2hh12_init(accel_addr);
-	printf("Ready. Send HELP for commands.\n");
+	lis2hh12_set_scale(accel_addr, 8); // matches the mg_per_lsb/fs_mg defaults above
+	printf("Ready. FS=+-8g. Send HELP for commands.\n");
 
 	char cmdbuf[48];
 	uint8_t cmdlen = 0;
 	uint32_t last_cmd_byte_ms = 0;
 	uint32_t last_stream_ms = 0;
 	uint32_t last_reported_pin_edges = 0;
+	uint32_t last_reported_pin2_edges = 0;
 	const uint32_t stream_period_ms = 50;
 	const uint32_t cmd_idle_timeout_ms = 500;
 
 	while (1)
 	{
+		// Proof the main loop is still running: reset both storm
+		// counters every pass. Only a sustained edge rate that never
+		// lets the loop come back around keeps climbing past the
+		// threshold in the ISR.
+		int_storm_count = 0;
+		int2_storm_count = 0;
+
 		int c;
 		while ((c = uart_getchar()) >= 0)
 		{
@@ -463,13 +665,34 @@ int main()
 				printf("INTEVENT,0x%02X\n", src);
 		}
 
-		// Real electrical INT1 pin: report spontaneously whenever the ISR
-		// has seen a new edge, independent of int_armed/I2C polling above.
+		if (impact_armed)
+		{
+			uint8_t src = 0;
+			if (!lis2hh12_read_reg(accel_addr, LIS2HH12_IG_SRC2, &src) && (src & LIS2HH12_IG_SRC_IA))
+				printf("IMPACTEVENT,0x%02X\n", src);
+		}
+
+		// Real electrical pins: report spontaneously whenever the ISR has
+		// seen a new edge, independent of the I2C polling above.
 		uint32_t edges_now = int_pin_edges;
 		if (edges_now != last_reported_pin_edges)
 		{
 			last_reported_pin_edges = edges_now;
-			printf("INTPIN,level=%d,edges=%lu\n", int_pin_level, (unsigned long)edges_now);
+			printf("INTPIN,level=%d,edges=%lu,tripped=%d\n",
+				int_pin_level, (unsigned long)edges_now, int_storm_tripped);
+			if (int_storm_tripped)
+				printf("ERR,INT1 (PD4/EXTI4) edge storm - disabled to protect the board. "
+					"Check the wiring, then re-arm (INT ON / WAKE ON) to retry.\n");
+		}
+		uint32_t edges2_now = int2_pin_edges;
+		if (edges2_now != last_reported_pin2_edges)
+		{
+			last_reported_pin2_edges = edges2_now;
+			printf("IMPACTPIN,level=%d,edges=%lu,tripped=%d\n",
+				int2_pin_level, (unsigned long)edges2_now, int2_storm_tripped);
+			if (int2_storm_tripped)
+				printf("ERR,INT2 (PD3/EXTI3) edge storm - disabled to protect the board. "
+					"Check the wiring, then re-arm (IMPACT ON) to retry.\n");
 		}
 
 		uint32_t now = systick_millis;
